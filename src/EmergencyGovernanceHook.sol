@@ -1,21 +1,35 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-interface IRWAVotingToken {
-    function totalSupply() external view returns (uint256);
-    function balanceOf(address account) external view returns (uint256);
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+interface IRWAVotesToken {
+    function getPastVotes(address account, uint256 timepoint) external view returns (uint256);
+    function getPastTotalSupply(uint256 timepoint) external view returns (uint256);
 }
 
 /**
  * @title EmergencyGovernanceHook
  * @author Parsa Abolhasani Rad (Aervynx Ecosystem)
- * @notice Fast-track on-chain governance for total loss settlement, operator replacement, and emergency protocol actions.
+ * @notice UUPS upgradeable snapshot-based governance hook for total-loss settlement,
+ *         operator replacement, and emergency protocol interventions using ERC20Votes checkpoints.
  */
-contract EmergencyGovernanceHook {
-    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+contract EmergencyGovernanceHook is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
+
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
 
     enum ProposalType {
         TOTAL_LOSS_SETTLEMENT,
@@ -26,7 +40,6 @@ contract EmergencyGovernanceHook {
 
     enum ProposalStatus {
         ACTIVE,
-        PASSED,
         REJECTED,
         EXECUTED,
         CANCELLED
@@ -40,6 +53,7 @@ contract EmergencyGovernanceHook {
         address target;
         bytes callData;
         bytes32 evidenceHash;
+        uint256 snapshotBlock;
         uint256 startTime;
         uint256 endTime;
         uint256 forVotes;
@@ -47,16 +61,17 @@ contract EmergencyGovernanceHook {
         ProposalStatus status;
     }
 
-    IRWAVotingToken public immutable votingToken;
+    uint256 private _reentrancyStatus;
 
-    uint256 public votingPeriod = 48 hours;
-    uint256 public quorumBps = 2000;            // 20% of total supply
-    uint256 public minProposerWeightBps = 100;  // 1% of total supply to create proposal
+    IRWAVotesToken public votingToken;
+
+    uint256 public votingPeriod;
+    uint256 public quorumBps;
+    uint256 public minProposerWeightBps;
     uint256 public nextProposalId;
 
-    mapping(bytes32 => mapping(address => bool)) private _roles;
     mapping(address => bool) public approvedTargets;
-    mapping(uint256 => Proposal) public proposals;
+    mapping(uint256 => Proposal) private _proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
 
     event TargetApproved(address indexed target, bool status);
@@ -65,29 +80,67 @@ contract EmergencyGovernanceHook {
         ProposalType proposalType,
         bytes32 indexed assetId,
         address indexed proposer,
+        uint256 snapshotBlock,
         uint256 endTime
     );
     event VoteCast(uint256 indexed proposalId, address indexed voter, bool support, uint256 weight);
     event ProposalExecuted(uint256 indexed proposalId, address indexed executor);
+    event ProposalRejected(uint256 indexed proposalId);
     event ProposalCancelled(uint256 indexed proposalId, address indexed guardian);
-    event GovernanceConfigUpdated(uint256 votingPeriod, uint256 quorumBps, uint256 minProposerWeightBps);
+    event GovernanceConfigUpdated(
+        uint256 votingPeriod,
+        uint256 quorumBps,
+        uint256 minProposerWeightBps
+    );
 
-    modifier onlyRole(bytes32 role) {
-        require(_roles[role][msg.sender], "AccessControl: unauthorized");
+    error InvalidAddress();
+    error InvalidEvidenceHash();
+    error TargetNotApproved(address target);
+    error InvalidGovernanceConfig();
+    error ZeroSnapshotSupply();
+    error InsufficientVotingPower(uint256 requiredWeight, uint256 actualWeight);
+    error ProposalNotFound(uint256 proposalId);
+    error ProposalNotActive(ProposalStatus status);
+    error VotingEnded(uint256 endTime);
+    error VotingStillActive(uint256 endTime);
+    error AlreadyVoted(uint256 proposalId, address voter);
+    error ProposalExecutionFailed();
+    error ReentrantCall();
+
+    modifier nonReentrant() {
+        if (_reentrancyStatus == _ENTERED) revert ReentrantCall();
+        _reentrancyStatus = _ENTERED;
         _;
+        _reentrancyStatus = _NOT_ENTERED;
     }
 
-    constructor(address _votingToken, address admin) {
-        require(_votingToken != address(0), "Invalid token");
-        require(admin != address(0), "Invalid admin");
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
 
-        votingToken = IRWAVotingToken(_votingToken);
-        _roles[DEFAULT_ADMIN_ROLE][admin] = true;
-        _roles[GUARDIAN_ROLE][admin] = true;
+    /**
+     * @notice Initializes governance with VehicleRWARegistry (ERC20Votes) and default 48h / 20% quorum settings.
+     */
+    function initialize(address _votingToken, address admin) public initializer {
+        if (_votingToken == address(0) || admin == address(0)) revert InvalidAddress();
+
+        __AccessControl_init();
+        __Pausable_init();
+
+        _reentrancyStatus = _NOT_ENTERED;
+        votingToken = IRWAVotesToken(_votingToken);
+        votingPeriod = 48 hours;
+        quorumBps = 2000;
+        minProposerWeightBps = 100;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(GUARDIAN_ROLE, admin);
+        _grantRole(UPGRADER_ROLE, admin);
     }
 
     function setApprovedTarget(address target, bool status) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(target != address(0), "Invalid target");
+        if (target == address(0)) revert InvalidAddress();
         approvedTargets[target] = status;
         emit TargetApproved(target, status);
     }
@@ -97,9 +150,13 @@ contract EmergencyGovernanceHook {
         uint256 _quorumBps,
         uint256 _minProposerWeightBps
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(_votingPeriod >= 1 hours && _votingPeriod <= 14 days, "Invalid voting period");
-        require(_quorumBps >= 500 && _quorumBps <= 8000, "Invalid quorum");
-        require(_minProposerWeightBps <= 2000, "Invalid proposer weight");
+        if (
+            _votingPeriod < 1 hours ||
+            _votingPeriod > 14 days ||
+            _quorumBps < 500 ||
+            _quorumBps > 8000 ||
+            _minProposerWeightBps > 2000
+        ) revert InvalidGovernanceConfig();
 
         votingPeriod = _votingPeriod;
         quorumBps = _quorumBps;
@@ -108,56 +165,61 @@ contract EmergencyGovernanceHook {
         emit GovernanceConfigUpdated(_votingPeriod, _quorumBps, _minProposerWeightBps);
     }
 
+    /**
+     * @notice Creates a proposal anchored to the previous block snapshot to prevent double-voting via transfers.
+     * @dev Token holders must call delegate(self) on VehicleRWARegistry prior to snapshotBlock to activate voting power.
+     */
     function createProposal(
         ProposalType proposalType,
         bytes32 assetId,
         address target,
         bytes calldata callData,
         bytes32 evidenceHash
-    ) external returns (uint256 proposalId) {
-        require(evidenceHash != bytes32(0), "Invalid evidence hash");
+    ) external whenNotPaused returns (uint256 proposalId) {
+        if (evidenceHash == bytes32(0)) revert InvalidEvidenceHash();
+        if (target != address(0) && !approvedTargets[target]) revert TargetNotApproved(target);
 
-        if (target != address(0)) {
-            require(approvedTargets[target], "Target not approved");
-        }
+        uint256 snapBlock = block.number > 0 ? block.number - 1 : 0;
 
-        if (!_roles[GUARDIAN_ROLE][msg.sender]) {
-            uint256 supply = votingToken.totalSupply();
-            require(supply > 0, "No token supply");
-            uint256 minWeight = (supply * minProposerWeightBps) / BPS_DENOMINATOR;
-            require(votingToken.balanceOf(msg.sender) >= minWeight, "Insufficient voting power");
+        if (!hasRole(GUARDIAN_ROLE, msg.sender)) {
+            uint256 pastSupply = votingToken.getPastTotalSupply(snapBlock);
+            if (pastSupply == 0) revert ZeroSnapshotSupply();
+
+            uint256 minWeight = (pastSupply * minProposerWeightBps) / BPS_DENOMINATOR;
+            uint256 proposerWeight = votingToken.getPastVotes(msg.sender, snapBlock);
+            if (proposerWeight < minWeight) {
+                revert InsufficientVotingPower(minWeight, proposerWeight);
+            }
         }
 
         proposalId = ++nextProposalId;
         uint256 endTime = block.timestamp + votingPeriod;
 
-        proposals[proposalId] = Proposal({
-            id: proposalId,
-            proposalType: proposalType,
-            assetId: assetId,
-            proposer: msg.sender,
-            target: target,
-            callData: callData,
-            evidenceHash: evidenceHash,
-            startTime: block.timestamp,
-            endTime: endTime,
-            forVotes: 0,
-            againstVotes: 0,
-            status: ProposalStatus.ACTIVE
-        });
+        Proposal storage p = _proposals[proposalId];
+        p.id = proposalId;
+        p.proposalType = proposalType;
+        p.assetId = assetId;
+        p.proposer = msg.sender;
+        p.target = target;
+        p.callData = callData;
+        p.evidenceHash = evidenceHash;
+        p.snapshotBlock = snapBlock;
+        p.startTime = block.timestamp;
+        p.endTime = endTime;
+        p.status = ProposalStatus.ACTIVE;
 
-        emit ProposalCreated(proposalId, proposalType, assetId, msg.sender, endTime);
+        emit ProposalCreated(proposalId, proposalType, assetId, msg.sender, snapBlock, endTime);
     }
 
-    function castVote(uint256 proposalId, bool support) external {
-        Proposal storage p = proposals[proposalId];
-        require(p.id != 0, "Proposal does not exist");
-        require(p.status == ProposalStatus.ACTIVE, "Proposal not active");
-        require(block.timestamp <= p.endTime, "Voting ended");
-        require(!hasVoted[proposalId][msg.sender], "Already voted");
+    function castVote(uint256 proposalId, bool support) external whenNotPaused {
+        Proposal storage p = _proposals[proposalId];
+        if (p.id == 0) revert ProposalNotFound(proposalId);
+        if (p.status != ProposalStatus.ACTIVE) revert ProposalNotActive(p.status);
+        if (block.timestamp > p.endTime) revert VotingEnded(p.endTime);
+        if (hasVoted[proposalId][msg.sender]) revert AlreadyVoted(proposalId, msg.sender);
 
-        uint256 weight = votingToken.balanceOf(msg.sender);
-        require(weight > 0, "No voting power");
+        uint256 weight = votingToken.getPastVotes(msg.sender, p.snapshotBlock);
+        if (weight == 0) revert InsufficientVotingPower(1, 0);
 
         hasVoted[proposalId][msg.sender] = true;
         if (support) {
@@ -169,50 +231,60 @@ contract EmergencyGovernanceHook {
         emit VoteCast(proposalId, msg.sender, support, weight);
     }
 
-    function executeProposal(uint256 proposalId) external {
-        Proposal storage p = proposals[proposalId];
-        require(p.id != 0, "Proposal does not exist");
-        require(p.status == ProposalStatus.ACTIVE, "Proposal not active");
-        require(block.timestamp > p.endTime, "Voting still active");
+    function executeProposal(uint256 proposalId) external whenNotPaused nonReentrant {
+        Proposal storage p = _proposals[proposalId];
+        if (p.id == 0) revert ProposalNotFound(proposalId);
+        if (p.status != ProposalStatus.ACTIVE) revert ProposalNotActive(p.status);
+        if (block.timestamp <= p.endTime) revert VotingStillActive(p.endTime);
 
-        uint256 supply = votingToken.totalSupply();
-        uint256 requiredQuorum = (supply * quorumBps) / BPS_DENOMINATOR;
+        uint256 pastSupply = votingToken.getPastTotalSupply(p.snapshotBlock);
+        uint256 requiredQuorum = (pastSupply * quorumBps) / BPS_DENOMINATOR;
         uint256 totalParticipation = p.forVotes + p.againstVotes;
 
-        if (totalParticipation < requiredQuorum || p.forVotes <= p.againstVotes) {
+        if (pastSupply == 0 || totalParticipation < requiredQuorum || p.forVotes <= p.againstVotes) {
             p.status = ProposalStatus.REJECTED;
+            emit ProposalRejected(proposalId);
             return;
         }
 
         p.status = ProposalStatus.EXECUTED;
 
         if (p.target != address(0) && p.callData.length > 0) {
-            require(approvedTargets[p.target], "Target not approved");
+            if (!approvedTargets[p.target]) revert TargetNotApproved(p.target);
             (bool success, ) = p.target.call(p.callData);
-            require(success, "Proposal execution failed");
+            if (!success) revert ProposalExecutionFailed();
         }
 
         emit ProposalExecuted(proposalId, msg.sender);
     }
 
     function cancelProposal(uint256 proposalId) external onlyRole(GUARDIAN_ROLE) {
-        Proposal storage p = proposals[proposalId];
-        require(p.id != 0, "Proposal does not exist");
-        require(p.status == ProposalStatus.ACTIVE, "Cannot cancel");
+        Proposal storage p = _proposals[proposalId];
+        if (p.id == 0) revert ProposalNotFound(proposalId);
+        if (p.status != ProposalStatus.ACTIVE) revert ProposalNotActive(p.status);
+
         p.status = ProposalStatus.CANCELLED;
         emit ProposalCancelled(proposalId, msg.sender);
     }
 
-    function grantRole(bytes32 role, address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(account != address(0), "Invalid account");
-        _roles[role][account] = true;
+    function getProposal(uint256 proposalId) external view returns (Proposal memory) {
+        if (_proposals[proposalId].id == 0) revert ProposalNotFound(proposalId);
+        return _proposals[proposalId];
     }
 
-    function revokeRole(bytes32 role, address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _roles[role][account] = false;
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
     }
 
-    function hasRole(bytes32 role, address account) external view returns (bool) {
-        return _roles[role][account];
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
     }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+
+    uint256[40] private __gap;
 }

@@ -1,36 +1,47 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
 /**
  * @title TelematicsOracleSync
  * @author Parsa Abolhasani Rad (Aervynx Ecosystem)
- * @notice On-chain IoT telematics bridge tracking mileage, vehicle health index, and dynamic reserve ratios.
+ * @notice UUPS upgradeable IoT telematics bridge tracking monotonic odometer, engine hours,
+ *         vehicle health index, and dynamic maintenance reserve ratios.
  */
-contract TelematicsOracleSync {
-    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+contract TelematicsOracleSync is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
     bytes32 public constant ORACLE_FEEDER_ROLE = keccak256("ORACLE_FEEDER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant MAX_RESERVE_BPS = 5000;
 
     struct VehicleTelemetry {
         uint256 odometerKm;
         uint256 engineHours;
-        uint256 fuelEfficiencyBps; // e.g., 1250 = 12.50 L/100km
-        uint8 healthIndex;         // 0 to 100
+        uint256 fuelEfficiencyBps;
+        uint8 healthIndex;
         uint256 lastUpdated;
         bytes32 telemetryDataHash;
         bool maintenanceRequired;
         bool initialized;
     }
 
-    uint256 public baseReserveBps = 1000;      // 10% when health >= 80
-    uint256 public elevatedReserveBps = 1500;  // 15% when 60 <= health < 80
-    uint256 public criticalReserveBps = 2500;  // 25% when health < 60
-    uint8 public alertHealthThreshold = 60;
+    uint256 public baseReserveBps;
+    uint256 public elevatedReserveBps;
+    uint256 public criticalReserveBps;
+    uint8 public alertHealthThreshold;
 
     bytes32[] public trackedAssets;
     mapping(bytes32 => VehicleTelemetry) public telemetryByAsset;
-    mapping(bytes32 => mapping(address => bool)) private _roles;
 
     event TelemetrySynced(
         bytes32 indexed assetId,
@@ -41,21 +52,44 @@ contract TelematicsOracleSync {
     );
     event MaintenanceAlertTriggered(bytes32 indexed assetId, uint8 healthIndex, uint256 odometerKm);
     event MaintenanceAlertCleared(bytes32 indexed assetId, uint8 newHealthIndex);
-    event ReservePolicyUpdated(uint256 baseBps, uint256 elevatedBps, uint256 criticalBps);
-    event RoleGranted(bytes32 indexed role, address indexed account);
-    event RoleRevoked(bytes32 indexed role, address indexed account);
+    event ReservePolicyUpdated(
+        uint256 baseBps,
+        uint256 elevatedBps,
+        uint256 criticalBps,
+        uint8 alertThreshold
+    );
 
-    modifier onlyRole(bytes32 role) {
-        require(_roles[role][msg.sender], "AccessControl: unauthorized");
-        _;
+    error InvalidAddress();
+    error InvalidAssetId();
+    error InvalidHealthIndex(uint8 healthIndex);
+    error InvalidTelemetryHash();
+    error OdometerRollbackDetected(uint256 previousKm, uint256 providedKm);
+    error EngineHoursRollbackDetected(uint256 previousHours, uint256 providedHours);
+    error AssetTelemetryNotInitialized(bytes32 assetId);
+    error InvalidReservePolicy();
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
     }
 
-    constructor(address admin) {
-        require(admin != address(0), "Invalid admin");
-        _roles[DEFAULT_ADMIN_ROLE][admin] = true;
-        _roles[ORACLE_FEEDER_ROLE][admin] = true;
-        emit RoleGranted(DEFAULT_ADMIN_ROLE, admin);
-        emit RoleGranted(ORACLE_FEEDER_ROLE, admin);
+    /**
+     * @notice Initializes telematics reserve policy (10% / 15% / 25%) and access roles.
+     */
+    function initialize(address admin) public initializer {
+        if (admin == address(0)) revert InvalidAddress();
+
+        __AccessControl_init();
+        __Pausable_init();
+
+        baseReserveBps = 1000;
+        elevatedReserveBps = 1500;
+        criticalReserveBps = 2500;
+        alertHealthThreshold = 60;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(ORACLE_FEEDER_ROLE, admin);
+        _grantRole(UPGRADER_ROLE, admin);
     }
 
     function syncTelemetry(
@@ -65,10 +99,10 @@ contract TelematicsOracleSync {
         uint256 fuelEfficiencyBps,
         uint8 healthIndex,
         bytes32 telemetryDataHash
-    ) external onlyRole(ORACLE_FEEDER_ROLE) {
-        require(assetId != bytes32(0), "Invalid assetId");
-        require(healthIndex <= 100, "Health index must be <= 100");
-        require(telemetryDataHash != bytes32(0), "Invalid telemetry hash");
+    ) external onlyRole(ORACLE_FEEDER_ROLE) whenNotPaused {
+        if (assetId == bytes32(0)) revert InvalidAssetId();
+        if (healthIndex > 100) revert InvalidHealthIndex(healthIndex);
+        if (telemetryDataHash == bytes32(0)) revert InvalidTelemetryHash();
 
         VehicleTelemetry storage data = telemetryByAsset[assetId];
 
@@ -76,8 +110,12 @@ contract TelematicsOracleSync {
             data.initialized = true;
             trackedAssets.push(assetId);
         } else {
-            require(odometerKm >= data.odometerKm, "Odometer rollback detected");
-            require(engineHours >= data.engineHours, "Engine hours rollback detected");
+            if (odometerKm < data.odometerKm) {
+                revert OdometerRollbackDetected(data.odometerKm, odometerKm);
+            }
+            if (engineHours < data.engineHours) {
+                revert EngineHoursRollbackDetected(data.engineHours, engineHours);
+            }
         }
 
         bool wasAlert = data.maintenanceRequired;
@@ -102,12 +140,12 @@ contract TelematicsOracleSync {
 
     function getRecommendedReserveBps(bytes32 assetId) public view returns (uint256) {
         VehicleTelemetry storage data = telemetryByAsset[assetId];
-        require(data.initialized, "Asset telemetry not initialized");
+        if (!data.initialized) revert AssetTelemetryNotInitialized(assetId);
 
         if (data.healthIndex >= 80) {
             return baseReserveBps;
         }
-        if (data.healthIndex >= 60) {
+        if (data.healthIndex >= alertHealthThreshold) {
             return elevatedReserveBps;
         }
         return criticalReserveBps;
@@ -119,8 +157,11 @@ contract TelematicsOracleSync {
             return 100;
         }
         uint256 totalHealth;
-        for (uint256 i = 0; i < count; i++) {
+        for (uint256 i = 0; i < count; ) {
             totalHealth += telemetryByAsset[trackedAssets[i]].healthIndex;
+            unchecked {
+                ++i;
+            }
         }
         return totalHealth / count;
     }
@@ -135,30 +176,35 @@ contract TelematicsOracleSync {
         uint256 _criticalBps,
         uint8 _alertThreshold
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(_baseBps <= _elevatedBps && _elevatedBps <= _criticalBps, "Invalid ascending order");
-        require(_criticalBps <= 5000, "Reserve cap exceeded");
-        require(_alertThreshold <= 90, "Invalid alert threshold");
+        if (
+            _baseBps > _elevatedBps ||
+            _elevatedBps > _criticalBps ||
+            _criticalBps > MAX_RESERVE_BPS ||
+            _alertThreshold == 0 ||
+            _alertThreshold > 80
+        ) revert InvalidReservePolicy();
 
         baseReserveBps = _baseBps;
         elevatedReserveBps = _elevatedBps;
         criticalReserveBps = _criticalBps;
         alertHealthThreshold = _alertThreshold;
 
-        emit ReservePolicyUpdated(_baseBps, _elevatedBps, _criticalBps);
+        emit ReservePolicyUpdated(_baseBps, _elevatedBps, _criticalBps, _alertThreshold);
     }
 
-    function grantRole(bytes32 role, address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(account != address(0), "Invalid account");
-        _roles[role][account] = true;
-        emit RoleGranted(role, account);
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
     }
 
-    function revokeRole(bytes32 role, address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _roles[role][account] = false;
-        emit RoleRevoked(role, account);
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
     }
 
-    function hasRole(bytes32 role, address account) external view returns (bool) {
-        return _roles[role][account];
-    }
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+
+    uint256[43] private __gap;
 }

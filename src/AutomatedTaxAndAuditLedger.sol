@@ -1,16 +1,28 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
 /**
  * @title AutomatedTaxAndAuditLedger
  * @author Parsa Abolhasani Rad (Aervynx Ecosystem)
- * @notice Immutable on-chain tax, depreciation, and regulatory audit ledger for SPV commercial vehicle fleets.
+ * @notice UUPS upgradeable, append-only on-chain tax, depreciation, and regulatory audit ledger
+ *         designed to compile without stack-too-deep issues.
  */
-contract AutomatedTaxAndAuditLedger {
-    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+contract AutomatedTaxAndAuditLedger is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
     bytes32 public constant ACCOUNTANT_ROLE = keccak256("ACCOUNTANT_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant MAX_TAX_RATE_BPS = 5000;
 
     struct EntryInput {
         bytes32 periodId;
@@ -61,7 +73,6 @@ contract AutomatedTaxAndAuditLedger {
     uint256 public totalTaxableIncome;
     uint256 public totalEstimatedTax;
 
-    mapping(bytes32 => mapping(address => bool)) private _roles;
     mapping(uint256 => LedgerEntry) private _entries;
     mapping(uint256 => AuditAdjustment) private _adjustments;
     mapping(bytes32 => uint256) public entryIdByPeriodAndAsset;
@@ -84,30 +95,49 @@ contract AutomatedTaxAndAuditLedger {
     );
     event TaxRateUpdated(uint256 oldRateBps, uint256 newRateBps);
 
-    modifier onlyRole(bytes32 role) {
-        require(_roles[role][msg.sender], "AccessControl: unauthorized");
-        _;
+    error InvalidAddress();
+    error InvalidTaxRate(uint256 rateBps);
+    error InvalidPeriodId();
+    error InvalidDocumentHash();
+    error EntryAlreadyExists(bytes32 periodId, bytes32 assetId);
+    error EntryNotFound(uint256 entryId);
+    error AdjustmentNotFound(uint256 adjustmentId);
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
     }
 
-    constructor(address admin, uint256 _taxRateBps) {
-        require(admin != address(0), "Invalid admin");
-        require(_taxRateBps <= 5000, "Tax rate exceeds 50%");
+    /**
+     * @notice Initializes the immutable audit ledger with corporate tax rate in basis points.
+     */
+    function initialize(address admin, uint256 _taxRateBps) public initializer {
+        if (admin == address(0)) revert InvalidAddress();
+        if (_taxRateBps > MAX_TAX_RATE_BPS) revert InvalidTaxRate(_taxRateBps);
+
+        __AccessControl_init();
+        __Pausable_init();
 
         taxRateBps = _taxRateBps;
-        _roles[DEFAULT_ADMIN_ROLE][admin] = true;
-        _roles[ACCOUNTANT_ROLE][admin] = true;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(ACCOUNTANT_ROLE, admin);
+        _grantRole(UPGRADER_ROLE, admin);
     }
 
     function recordPeriodEntry(EntryInput calldata input)
         external
         onlyRole(ACCOUNTANT_ROLE)
+        whenNotPaused
         returns (uint256 entryId)
     {
-        require(input.periodId != bytes32(0), "Invalid periodId");
-        require(input.auditDocHash != bytes32(0), "Invalid audit doc hash");
+        if (input.periodId == bytes32(0)) revert InvalidPeriodId();
+        if (input.auditDocHash == bytes32(0)) revert InvalidDocumentHash();
 
         bytes32 compositeKey = keccak256(abi.encodePacked(input.periodId, input.assetId));
-        require(entryIdByPeriodAndAsset[compositeKey] == 0, "Entry already exists for period and asset");
+        if (entryIdByPeriodAndAsset[compositeKey] != 0) {
+            revert EntryAlreadyExists(input.periodId, input.assetId);
+        }
 
         entryId = ++nextEntryId;
         entryIdByPeriodAndAsset[compositeKey] = entryId;
@@ -136,9 +166,9 @@ contract AutomatedTaxAndAuditLedger {
         int256 taxableIncomeDelta,
         int256 taxDelta,
         bytes32 justificationHash
-    ) external onlyRole(ACCOUNTANT_ROLE) returns (uint256 adjustmentId) {
-        require(_entries[originalEntryId].entryId != 0, "Original entry does not exist");
-        require(justificationHash != bytes32(0), "Invalid justification hash");
+    ) external onlyRole(ACCOUNTANT_ROLE) whenNotPaused returns (uint256 adjustmentId) {
+        if (_entries[originalEntryId].entryId == 0) revert EntryNotFound(originalEntryId);
+        if (justificationHash == bytes32(0)) revert InvalidDocumentHash();
 
         adjustmentId = ++nextAdjustmentId;
 
@@ -161,7 +191,7 @@ contract AutomatedTaxAndAuditLedger {
     }
 
     function getEntry(uint256 entryId) external view returns (LedgerEntry memory) {
-        require(_entries[entryId].entryId != 0, "Entry does not exist");
+        if (_entries[entryId].entryId == 0) revert EntryNotFound(entryId);
         return _entries[entryId];
     }
 
@@ -170,33 +200,30 @@ contract AutomatedTaxAndAuditLedger {
         bytes32 assetId
     ) external view returns (LedgerEntry memory) {
         uint256 entryId = entryIdByPeriodAndAsset[keccak256(abi.encodePacked(periodId, assetId))];
-        require(entryId != 0, "Entry does not exist");
+        if (entryId == 0) revert EntryNotFound(entryId);
         return _entries[entryId];
     }
 
     function getAdjustment(uint256 adjustmentId) external view returns (AuditAdjustment memory) {
-        require(_adjustments[adjustmentId].adjustmentId != 0, "Adjustment does not exist");
+        if (_adjustments[adjustmentId].adjustmentId == 0) {
+            revert AdjustmentNotFound(adjustmentId);
+        }
         return _adjustments[adjustmentId];
     }
 
     function setTaxRateBps(uint256 newRateBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(newRateBps <= 5000, "Tax rate exceeds 50%");
+        if (newRateBps > MAX_TAX_RATE_BPS) revert InvalidTaxRate(newRateBps);
         uint256 oldRate = taxRateBps;
         taxRateBps = newRateBps;
         emit TaxRateUpdated(oldRate, newRateBps);
     }
 
-    function grantRole(bytes32 role, address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(account != address(0), "Invalid account");
-        _roles[role][account] = true;
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
     }
 
-    function revokeRole(bytes32 role, address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _roles[role][account] = false;
-    }
-
-    function hasRole(bytes32 role, address account) external view returns (bool) {
-        return _roles[role][account];
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
     }
 
     function _calculateTax(
@@ -247,4 +274,12 @@ contract AutomatedTaxAndAuditLedger {
             accumulatedDepreciationByAsset[input.assetId] += input.depreciationAmount;
         }
     }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+
+    uint256[39] private __gap;
 }
